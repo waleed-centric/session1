@@ -3,16 +3,16 @@
 //|  MS Trading London + NY liquidity-sweep (Phase 2: live trades)   |
 //+------------------------------------------------------------------+
 #property copyright "CentricTech"
-#property version   "1.10"
-#property description "MS Trading LN/NY — signals + execution"
+#property version   "1.14"
+#property description "MS Trading LN/NY — entry inside POI only + session TP"
 
 #include <Trade/Trade.mqh>
 
 enum ENUM_MANUAL_BIAS
 {
-   BIAS_NONE = 0,  // None
-   BIAS_BUY  = 1,  // Buy
-   BIAS_SELL = 2   // Sell
+   BIAS_BUY  = 0,  // Buy   (0 = default; sticky tester inputs with 0 still trade)
+   BIAS_SELL = 1,  // Sell
+   BIAS_NONE = 2   // None  — strategy waits
 };
 
 enum ENUM_SETUP_STATE
@@ -33,7 +33,7 @@ enum ENUM_KILLZONE
 };
 
 input group "=== Bias (locked manual) ==="
-input ENUM_MANUAL_BIAS InpBias = BIAS_NONE;
+input ENUM_MANUAL_BIAS InpBias = BIAS_BUY;
 
 input group "=== Sessions (GMT-5 / NY) ==="
 input int InpAsiaStartHour   = 20;
@@ -48,7 +48,8 @@ input int InpPreSweepMinutes = 60;   // sweep allowed before killzone open
 input group "=== Structure ==="
 input int    InpSwingStrength = 2;
 input int    InpScanBars      = 120;
-input double InpMinFvgPoints  = 50;
+input double InpMinFvgPoints  = 20;   // gold points (_Point units)
+input double InpFallbackRR    = 0.0;  // IGNORED — session TP only (kept for old .set compat)
 
 input group "=== Visual ==="
 input bool  InpDrawSessions = true;
@@ -60,7 +61,7 @@ input color InpNYColor      = C'20,40,90';
 
 input group "=== Trade (Phase 2) ==="
 input bool   InpEnableTrade   = true;
-input double InpLot           = 0.01;
+input double InpLot           = 0.1;
 input int    InpMagic         = 261123;
 input int    InpSlippage      = 30;
 input int    InpMaxTradesDay  = 2;
@@ -100,8 +101,14 @@ int OnInit()
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(InpSlippage);
    trade.SetTypeFillingBySymbol(_Symbol);
-   PrintFormat("MS_LondonNY_SessionEA v1.10 | trade=%s lot=%.2f",
-               (InpEnableTrade?"ON":"OFF"), InpLot);
+   string biasName = (InpBias==BIAS_BUY?"BUY":(InpBias==BIAS_SELL?"SELL":"NONE"));
+   double nlot = NormalizeLot(InpLot);
+   PrintFormat("MS_LondonNY_SessionEA v1.14 | bias=%s trade=%s lot=%.2f (norm=%.2f min=%.2f step=%.2f) entry=insidePOI sessionTP=strict",
+               biasName, (InpEnableTrade?"ON":"OFF"), InpLot, nlot,
+               SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN),
+               SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP));
+   if(InpBias == BIAS_NONE)
+      Print("WARNING: Bias=None — strategy idle until Buy/Sell is set");
    return(INIT_SUCCEEDED);
 }
 
@@ -145,10 +152,39 @@ void OnTick()
       ENUM_KILLZONE kzEntry = CurrentKillzone(ny);
       ENUM_KILLZONE kzLogic = ActiveOrUpcomingKillzone(ny);
       ProcessStrategy(ny, kzLogic, kzEntry);
+
+      // Killzone closed without fill → skip session (video patience)
+      if((g_state == ST_WAIT_POI || g_state == ST_READY || g_state == ST_SWEPT || g_state == ST_MSS) &&
+         CurrentKillzone(ny) == KZ_NONE &&
+         !InSweepWindowFor(g_kz, ny) &&
+         g_kz != KZ_NONE)
+      {
+         PrintFormat("Session skip %s — no live POI tap/fill",
+                     (g_kz==KZ_LONDON?"London":"NY"));
+         // Keep London POI for possible NY continuation; clear active setup
+         if(g_kz == KZ_LONDON && g_lonPoiValid) { /* keep stored POI */ }
+         g_state = ST_IDLE;
+         g_contMode = false;
+      }
    }
 
+   // Video: mark READY only on live tap inside London/NY (every tick)
+   if(g_state == ST_WAIT_POI)
+   {
+      ENUM_KILLZONE kzNow = CurrentKillzone(ny);
+      if(kzNow != KZ_NONE && kzNow == g_kz)
+         TryMarkReady(kzNow);
+   }
+
+   // Leave READY if price left inside-POI or session ended before fill
    if(g_state == ST_READY)
-      TryOpenTrade();
+   {
+      ENUM_KILLZONE kzNow = CurrentKillzone(ny);
+      if(kzNow != g_kz || !EntryPriceInsidePOI(g_poiBull))
+         g_state = ST_WAIT_POI;
+      else
+         TryOpenTrade();
+   }
 
    DrawSetupObjects();
    UpdateStatus(StateText());
@@ -332,28 +368,37 @@ void ProcessStrategy(datetime ny, ENUM_KILLZONE kzLogic, ENUM_KILLZONE kzEntry)
    if(!priorOk) return;
    if(g_state == ST_READY && g_kz == kzLogic) return;
 
-   // --- Fresh sweep model ---
+   // --- Fresh sweep model (latch: do NOT re-arm every bar) ---
+   bool alreadyInModel = (!g_contMode && g_kz == kzLogic &&
+                          (g_state == ST_SWEPT || g_state == ST_MSS ||
+                           g_state == ST_WAIT_POI || g_state == ST_READY));
+
+   double prevExt = g_sweepExt;
    bool swept = DetectAlignedSweep(ny, kzLogic, priorH, priorL, wantHigh, wantLow, true);
    if(swept)
    {
-      // new sweep on this killzone restarts model (overrides continuation)
-      g_state = ST_SWEPT;
-      g_kz = kzLogic;
-      g_sweepHigh = wantHigh;
-      g_sweepLevel = wantHigh ? priorH : priorL;
-      g_contMode = false;
-      g_setupTraded = false;
-      g_poiTop=g_poiBot=0;
-      g_mssLevel=0;
-      g_mssTime=0;
+      bool deeper = (wantLow  && g_sweepExt < prevExt - _Point) ||
+                    (wantHigh && g_sweepExt > prevExt + _Point) ||
+                    (prevExt <= 0);
+      // First arm, or deeper sweep on same kz → restart. Same sweep while in model → keep state.
+      if(!alreadyInModel || deeper)
+      {
+         g_state = ST_SWEPT;
+         g_kz = kzLogic;
+         g_sweepHigh = wantHigh;
+         g_sweepLevel = wantHigh ? priorH : priorL;
+         g_contMode = false;
+         g_setupTraded = false;
+         g_poiTop=g_poiBot=0;
+         g_mssLevel=0;
+         g_mssTime=0;
+         PrintFormat("Sweep armed %s level=%.2f ext=%.2f",
+                     (kzLogic==KZ_LONDON?"London":"NY"), g_sweepLevel, g_sweepExt);
+      }
    }
 
    if(g_state != ST_SWEPT && g_state != ST_MSS && g_state != ST_WAIT_POI)
-   {
-      // continuation WaitPOI handled below
-      if(!(g_contMode && g_state == ST_WAIT_POI))
-         return;
-   }
+      return;
 
    if(!g_contMode && (g_state == ST_SWEPT || g_state == ST_MSS || g_state == ST_WAIT_POI))
    {
@@ -363,15 +408,20 @@ void ProcessStrategy(datetime ny, ENUM_KILLZONE kzLogic, ENUM_KILLZONE kzEntry)
          if(IsLondonClose(mssNy) && CurrentKillzone(mssNy) == KZ_NONE)
          {
             g_state = ST_INVALID;
+            Print("Setup invalid: MSS only in London Close");
             return;
          }
          if(g_state == ST_SWEPT)
+         {
             g_state = ST_MSS;
-         if(BuildLastPOI(wantLow))
+            PrintFormat("MSS confirmed level=%.2f", g_mssLevel);
+         }
+         if(g_state != ST_WAIT_POI && BuildLastPOI(wantLow))
          {
             g_state = ST_WAIT_POI;
             if(kzLogic == KZ_LONDON)
                StoreLondonPoi();
+            PrintFormat("POI built %.2f-%.2f", g_poiBot, g_poiTop);
          }
       }
    }
@@ -455,28 +505,67 @@ void StoreLondonPoi()
    g_lonPoiValid = true;
 }
 
+bool PriceTouchingPOI()
+{
+   if(g_poiTop <= 0 || g_poiBot <= 0) return false;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   // Bid/ask range overlaps POI band
+   return !(ask < g_poiBot || bid > g_poiTop);
+}
+
+// Do not chase: executable price must sit inside the POI box
+bool EntryPriceInsidePOI(bool isBuy)
+{
+   if(g_poiTop <= 0 || g_poiBot <= 0) return false;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(isBuy)
+      return (ask >= g_poiBot && ask <= g_poiTop);
+   return (bid >= g_poiBot && bid <= g_poiTop);
+}
+
 void TryMarkReady(ENUM_KILLZONE kzEntry)
 {
    if(g_setupTraded) return;
    if(g_state == ST_READY && g_kz == kzEntry) return;
-   for(int i=0; i<=3; i++)
+   if(g_poiTop <= 0 || g_poiBot <= 0) return;
+
+   // Video: must be inside killzone NOW
+   if(CurrentKillzone(NowNY()) != kzEntry) return;
+
+   // Live tap only — current + just-closed M5 bar (no full-session history)
+   bool barTap = false;
+   for(int i=0; i<=1; i++)
    {
       datetime st = iTime(_Symbol, PERIOD_M5, i);
+      if(st == 0) continue;
       datetime n = ServerToNY(st);
       if(CurrentKillzone(n) != kzEntry) continue;
       double hi=iHigh(_Symbol,PERIOD_M5,i);
       double lo=iLow(_Symbol,PERIOD_M5,i);
       if(hi >= g_poiBot && lo <= g_poiTop)
       {
-         g_state = ST_READY;
-         g_kz = kzEntry;
-         g_beDone = false;
-         PrintFormat("SetupReady %s kz=%s cont=%d POI=%.2f-%.2f",
-                     _Symbol, (kzEntry==KZ_LONDON?"London":"NY"),
-                     (int)g_contMode, g_poiBot, g_poiTop);
+         barTap = true;
          break;
       }
    }
+   if(!barTap) return;
+   if(!EntryPriceInsidePOI(g_poiBull)) return;
+
+   // Session TP must still be valid at tap (video first target)
+   double sl=0, tp=0;
+   if(!ComputeSLTP(g_poiBull, sl, tp))
+      return;
+
+   g_state = ST_READY;
+   g_kz = kzEntry;
+   g_beDone = false;
+   PrintFormat("SetupReady LIVE %s kz=%s cont=%d POI=%.2f-%.2f ask=%.2f bid=%.2f",
+               _Symbol, (kzEntry==KZ_LONDON?"London":"NY"),
+               (int)g_contMode, g_poiBot, g_poiTop,
+               SymbolInfoDouble(_Symbol, SYMBOL_ASK),
+               SymbolInfoDouble(_Symbol, SYMBOL_BID));
 }
 
 //+------------------------------------------------------------------+
@@ -485,29 +574,31 @@ void TryMarkReady(ENUM_KILLZONE kzEntry)
 bool ComputeSLTP(bool isBuy, double &sl, double &tp)
 {
    double buf = InpSLBufferPts * _Point;
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
    if(isBuy)
    {
       sl = g_poiBot - buf;
       if(InpUseSafeSL && g_sweepExt > 0 && !g_contMode)
          sl = MathMin(sl, g_sweepExt - buf);
+      if(sl >= ask) return false;
+
       tp = SessionTargetHigh();
-      if(tp <= SymbolInfoDouble(_Symbol, SYMBOL_ASK))
-         return false;
-      if(sl >= SymbolInfoDouble(_Symbol, SYMBOL_ASK))
-         return false;
+      // Video: first target = session extreme only (no RR fallback)
+      if(tp <= ask) return false;
    }
    else
    {
       sl = g_poiTop + buf;
       if(InpUseSafeSL && g_sweepExt > 0 && !g_contMode)
          sl = MathMax(sl, g_sweepExt + buf);
+      if(sl <= bid) return false;
+
       tp = SessionTargetLow();
-      if(tp <= 0 || tp >= SymbolInfoDouble(_Symbol, SYMBOL_BID))
-         return false;
-      if(sl <= SymbolInfoDouble(_Symbol, SYMBOL_BID))
-         return false;
+      if(tp <= 0 || tp >= bid) return false;
    }
-   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    sl = NormalizeDouble(sl, digits);
    tp = NormalizeDouble(tp, digits);
    return true;
@@ -526,6 +617,22 @@ int CountEAPositions()
    return n;
 }
 
+double NormalizeLot(double lot)
+{
+   double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double vstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(vstep <= 0) vstep = 0.01;
+   if(vmin <= 0) vmin = vstep;
+   if(vmax <= 0) vmax = 100.0;
+   lot = MathMax(vmin, MathMin(vmax, lot));
+   lot = MathFloor(lot / vstep + 1e-8) * vstep;
+   int digs = 0;
+   double s = vstep;
+   while(digs < 8 && MathAbs(s - MathRound(s)) > 1e-8) { s *= 10.0; digs++; }
+   return NormalizeDouble(lot, digs);
+}
+
 bool TryOpenTrade()
 {
    if(!InpEnableTrade) return false;
@@ -538,10 +645,29 @@ bool TryOpenTrade()
    if(InpBias == BIAS_BUY && !isBuy) return false;
    if(InpBias == BIAS_SELL && isBuy) return false;
 
+   double lot = NormalizeLot(InpLot);
+   if(lot < SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN) - 1e-8)
+   {
+      PrintFormat("Skip: lot invalid req=%.2f norm=%.2f min=%.2f step=%.2f",
+                  InpLot, lot,
+                  SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN),
+                  SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP));
+      return false;
+   }
+
    double sl=0, tp=0;
+   // Video: only enter while inside killzone AND executable price inside POI
+   if(CurrentKillzone(NowNY()) != g_kz || !EntryPriceInsidePOI(isBuy))
+   {
+      g_state = ST_WAIT_POI;
+      return false;
+   }
+
    if(!ComputeSLTP(isBuy, sl, tp))
    {
-      Print("Skip trade: invalid SL/TP distance vs session target");
+      PrintFormat("Skip: session TP/SL invalid at live tap (ask=%.2f poi=%.2f-%.2f)",
+                  SymbolInfoDouble(_Symbol,SYMBOL_ASK), g_poiBot, g_poiTop);
+      g_state = ST_WAIT_POI;
       return false;
    }
 
@@ -550,23 +676,24 @@ bool TryOpenTrade()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double minDist = stops * _Point;
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
    if(isBuy)
    {
-      if(ask - sl < minDist) sl = NormalizeDouble(ask - minDist - _Point, (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
-      if(tp - ask < minDist) { Print("Skip: TP too close"); return false; }
+      if(ask - sl < minDist) sl = NormalizeDouble(ask - minDist - _Point, digits);
+      if(tp - ask < minDist) { Print("Skip: TP too close"); g_state=ST_WAIT_POI; return false; }
    }
    else
    {
-      if(sl - bid < minDist) sl = NormalizeDouble(bid + minDist + _Point, (int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS));
-      if(bid - tp < minDist) { Print("Skip: TP too close"); return false; }
+      if(sl - bid < minDist) sl = NormalizeDouble(bid + minDist + _Point, digits);
+      if(bid - tp < minDist) { Print("Skip: TP too close"); g_state=ST_WAIT_POI; return false; }
    }
 
    string cmt = StringFormat("MSLN %s%s", (g_kz==KZ_LONDON?"LON":"NY"), (g_contMode?" CONT":""));
    bool ok = false;
    if(isBuy)
-      ok = trade.Buy(InpLot, _Symbol, 0, sl, tp, cmt);
+      ok = trade.Buy(lot, _Symbol, 0, sl, tp, cmt);
    else
-      ok = trade.Sell(InpLot, _Symbol, 0, sl, tp, cmt);
+      ok = trade.Sell(lot, _Symbol, 0, sl, tp, cmt);
 
    if(ok)
    {
@@ -579,7 +706,14 @@ bool TryOpenTrade()
                   (isBuy?"BUY":"SELL"), sl, tp, g_tradesToday);
       return true;
    }
-   PrintFormat("Order failed retcode=%d %s", trade.ResultRetcode(), trade.ResultRetcodeDescription());
+   uint rc = trade.ResultRetcode();
+   PrintFormat("Order failed retcode=%d %s lot=%.2f", rc, trade.ResultRetcodeDescription(), lot);
+   // permanent rejects — stop tick spam
+   if(rc == 10014 || rc == 10016 || rc == 10019 || rc == 10030)
+   {
+      g_setupTraded = true;
+      g_state = ST_IDLE;
+   }
    return false;
 }
 
@@ -880,7 +1014,7 @@ string StateText()
       case ST_INVALID:  st="Invalid"; break;
       default: st="?";
    }
-   return StringFormat("MS LN/NY v1.10 | Bias:%s | KZ:%s | %s | Trade:%s\nAsia %.2f/%.2f | Lon %.2f/%.2f | LonPOI:%s | DayTrades:%d/%d | Open:%d",
+   return StringFormat("MS LN/NY v1.14 | Bias:%s | KZ:%s | %s | Trade:%s\nAsia %.2f/%.2f | Lon %.2f/%.2f | LonPOI:%s | DayTrades:%d/%d | Open:%d",
                        b, kz, st, (InpEnableTrade?"ON":"OFF"),
                        g_asiaL, g_asiaH, g_lonL, g_lonH,
                        (g_lonPoiValid?"yes":"no"),
